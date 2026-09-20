@@ -152,7 +152,8 @@ describe("Meta portfolio token resolution", () => {
     assert.match(missingMetaTokenEnvHint("hamill"), /META_HAMILL_ACCESS_TOKEN/);
     assert.match(missingMetaTokenEnvHint("adeptos"), /BRAND_ADEPTOS_META_ACCESS_TOKEN/);
     assert.match(missingMetaTokenEnvHint("adeptos"), /META_HAMILL_ACCESS_TOKEN/);
-    assert.equal(missingMetaTokenEnvHint("zono").includes("META_ACCESS_TOKEN"), false);
+    assert.ok(!brandMetaTokenEnvKeys("zono").includes("META_ACCESS_TOKEN"));
+    assert.ok(!brandMetaTokenEnvKeys("zono").includes("META_HAMILL_ACCESS_TOKEN"));
     assert.deepEqual(brandMetaTokenEnvKeys("zono"), [
       "BRAND_ZONO_META_ACCESS_TOKEN",
       "META_ZONO_ACCESS_TOKEN",
