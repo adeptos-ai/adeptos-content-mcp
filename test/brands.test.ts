@@ -41,6 +41,8 @@ describe("brands", () => {
   it("reports missing TikTok/YouTube/LinkedIn/X env separately", () => {
     setEnv({
       META_ACCESS_TOKEN: undefined,
+      META_HAMILL_ACCESS_TOKEN: undefined,
+      BRAND_HAMILL_META_ACCESS_TOKEN: undefined,
       BRAND_HAMILL_IG_USER_ID: undefined,
       BRAND_HAMILL_TIKTOK_OPEN_ID: undefined,
     });

@@ -1,3 +1,4 @@
+import { missingMetaTokenEnvHint, missingMetaTokenError, resolveBrandMetaAccessToken } from "./meta-tokens.js";
 import { BRAND_KEYS, type BrandKey } from "./types.js";
 
 export type BrandConfig = {
@@ -96,7 +97,7 @@ export function loadBrand(brand: BrandKey): BrandConfig {
   const missingMeta: string[] = [];
   if (!igUserId) missingMeta.push(`${prefix}_IG_USER_ID`);
   if (!pageId) missingMeta.push(`${prefix}_PAGE_ID`);
-  if (!env("META_ACCESS_TOKEN")) missingMeta.push("META_ACCESS_TOKEN");
+  if (!resolveBrandMetaAccessToken(brand)) missingMeta.push(missingMetaTokenEnvHint(brand));
 
   const missingTikTok: string[] = [];
   if (!tiktokOpenId) missingTikTok.push(`${prefix}_TIKTOK_OPEN_ID`);
@@ -159,8 +160,8 @@ export function requireMetaIg(brand: BrandKey): BrandConfig {
       `missing_brand_config: ${brand} has no IG user id. Set ${brandEnvPrefix(brand)}_IG_USER_ID. Leo owns Meta (Rec0C3QKVTL0Y).`,
     );
   }
-  if (!process.env.META_ACCESS_TOKEN?.trim()) {
-    throw new Error("META_ACCESS_TOKEN is not set. Leonardo owns token mint (Rec0C3QKVTL0Y).");
+  if (!resolveBrandMetaAccessToken(brand)) {
+    throw missingMetaTokenError(brand);
   }
   return cfg;
 }

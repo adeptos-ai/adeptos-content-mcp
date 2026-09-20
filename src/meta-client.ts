@@ -3,7 +3,9 @@
  * Not the Marketing API. Token stays in env; URLs are never logged.
  */
 
+import { requireBrandMetaAccessToken, resolveBrandMetaAccessToken } from "./meta-tokens.js";
 import { redactDeep, redactString, safeErrorMessage } from "./safety.js";
+import type { BrandKey } from "./types.js";
 
 export const DEFAULT_GRAPH_VERSION = "v21.0";
 export const GRAPH_BASE = "https://graph.facebook.com";
@@ -27,18 +29,12 @@ export class MetaApiError extends Error {
   }
 }
 
-export function getAccessTokenFromEnv(): string {
-  const token = process.env.META_ACCESS_TOKEN?.trim();
-  if (!token) {
-    throw new Error(
-      "META_ACCESS_TOKEN is not set. Copy .env.example to .env. Leonardo owns token mint (Rec0C3QKVTL0Y).",
-    );
-  }
-  return token;
+export function getAccessTokenFromEnv(brand: BrandKey): string {
+  return requireBrandMetaAccessToken(brand);
 }
 
-export function tryGetAccessToken(): string | undefined {
-  return process.env.META_ACCESS_TOKEN?.trim() || undefined;
+export function tryGetAccessToken(brand: BrandKey): string | undefined {
+  return resolveBrandMetaAccessToken(brand);
 }
 
 export function getGraphVersion(): string {
@@ -203,16 +199,16 @@ function encodeForm(body: Record<string, unknown>): string {
   return params.toString();
 }
 
-export function createMetaClientFromEnv(fetchImpl?: typeof fetch): MetaClient {
+export function createMetaClientFromEnv(brand: BrandKey, fetchImpl?: typeof fetch): MetaClient {
   return new MetaClient({
-    accessToken: getAccessTokenFromEnv(),
+    accessToken: getAccessTokenFromEnv(brand),
     graphVersion: getGraphVersion(),
     fetchImpl,
   });
 }
 
-export function createMetaClientOptional(fetchImpl?: typeof fetch): MetaClient | null {
-  const token = tryGetAccessToken();
+export function createMetaClientOptional(brand: BrandKey, fetchImpl?: typeof fetch): MetaClient | null {
+  const token = tryGetAccessToken(brand);
   if (!token) return null;
   return new MetaClient({
     accessToken: token,

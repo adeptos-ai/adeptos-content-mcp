@@ -32,6 +32,7 @@ import { resolveSource } from "./http-media.js";
 import { LinkedInClient } from "./linkedin-client.js";
 import { limitsList } from "./media-limits.js";
 import { createMetaClientFromEnv, createMetaClientOptional, type MetaClient } from "./meta-client.js";
+import { missingMetaTokenError } from "./meta-tokens.js";
 import { normalizePlatforms, schedulePathFor } from "./platforms.js";
 import { requireConfirm, type WriteSafetyArgs } from "./safety.js";
 import { MediaRegistry, ScheduleStore, newScheduleId } from "./store.js";
@@ -69,12 +70,17 @@ function scheduleStore(deps?: ServiceDeps): ScheduleStore {
 function fetchImpl(deps?: ServiceDeps): typeof fetch {
   return deps?.fetchImpl ?? fetch;
 }
-function metaClient(deps?: ServiceDeps): MetaClient {
+function metaClient(deps: ServiceDeps | undefined, brand: BrandKey): MetaClient {
   if (deps?.client) return deps.client;
   if (deps && "client" in deps && deps.client === null) {
-    throw new Error("META_ACCESS_TOKEN is not set. Leonardo owns token mint (Rec0C3QKVTL0Y).");
+    throw missingMetaTokenError(brand);
   }
-  return createMetaClientFromEnv(deps?.fetchImpl);
+  return createMetaClientFromEnv(brand, deps?.fetchImpl);
+}
+
+function metaClientForBrand(cfgBrand: BrandKey, deps: ServiceDeps = {}): MetaClient | null {
+  if (deps.client !== undefined) return deps.client;
+  return createMetaClientOptional(cfgBrand, deps.fetchImpl);
 }
 
 function platformRow(
@@ -94,10 +100,10 @@ function platformRow(
 
 export async function listAccounts(opts: { brand?: string } = {}, deps: ServiceDeps = {}) {
   const brands = opts.brand ? [loadBrand(resolveBrand(opts.brand))] : loadAllBrands();
-  const client = deps.client === undefined ? createMetaClientOptional(deps.fetchImpl) : deps.client;
   const accounts: BrandAccount[] = [];
 
   for (const cfg of brands) {
+    const client = metaClientForBrand(cfg.brand, deps);
     const platforms: PlatformAccount[] = [
       platformRow("meta_ig", cfg.igUserId, cfg.missingMeta.filter((m) => !m.includes("PAGE_ID"))),
       platformRow("meta_fb", cfg.pageId, cfg.missingMeta.filter((m) => !m.includes("IG_USER"))),
@@ -190,7 +196,7 @@ export async function uploadMedia(
   if (wantsIg) {
     const cfg = requireMetaIg(brand);
     igUserId = cfg.igUserId!;
-    const client = metaClient(deps);
+    const client = metaClient(deps, brand);
     const created =
       mediaType === "photo"
         ? await createIgImageContainer(client, igUserId, {
@@ -260,7 +266,7 @@ export async function createCarousel(
     return rec;
   });
 
-  const client = metaClient(deps);
+  const client = metaClient(deps, brand);
   if (deps.waitForReady !== false) {
     for (const id of ids) await waitForContainer(client, id, { timeoutMs: 180_000 });
   }
@@ -545,7 +551,7 @@ async function executePlatform(opts: {
 
   if (platform === "meta_ig") {
     const cfg = requireMetaIg(brand);
-    const client = metaClient(opts.deps);
+    const client = metaClient(opts.deps, brand);
     let creation = opts.containerId;
     if (!creation) {
       const first = media[0];
@@ -677,7 +683,7 @@ async function publishFacebook(
   path: ScheduleJob["path"],
 ): Promise<PlatformResult> {
   const cfg = requireMetaPage(opts.brand);
-  const client = metaClient(opts.deps);
+  const client = metaClient(opts.deps, opts.brand);
   const pageToken = await getPageToken(client, cfg.pageId!);
   const scheduledUnix = opts.publishNow ? undefined : toUnixSeconds(opts.publishAtUtc);
   let result: { id?: string };
@@ -732,20 +738,19 @@ export async function listScheduled(opts: { brand?: string } = {}, deps: Service
   const brand = opts.brand ? resolveBrand(opts.brand) : undefined;
   const local = scheduleStore(deps).list(brand ? { brand } : {});
   const facebook_scheduled: Array<Record<string, unknown>> = [];
-  const client = deps.client === undefined ? createMetaClientOptional(deps.fetchImpl) : deps.client;
-  if (client) {
-    const brands = brand ? [loadBrand(brand)] : loadAllBrands();
-    for (const cfg of brands) {
-      if (!cfg.pageId) continue;
-      try {
-        const pageToken = await getPageToken(client, cfg.pageId);
-        const data = (await listFbScheduled(client, cfg.pageId, pageToken)) as { data?: Array<Record<string, unknown>> };
-        for (const row of data.data ?? []) {
-          facebook_scheduled.push({ ...row, brand: cfg.brand, source: "facebook_scheduled_posts" });
-        }
-      } catch {
-        /* best-effort */
+  const brands = brand ? [loadBrand(brand)] : loadAllBrands();
+  for (const cfg of brands) {
+    if (!cfg.pageId) continue;
+    const client = metaClientForBrand(cfg.brand, deps);
+    if (!client) continue;
+    try {
+      const pageToken = await getPageToken(client, cfg.pageId);
+      const data = (await listFbScheduled(client, cfg.pageId, pageToken)) as { data?: Array<Record<string, unknown>> };
+      for (const row of data.data ?? []) {
+        facebook_scheduled.push({ ...row, brand: cfg.brand, source: "facebook_scheduled_posts" });
       }
+    } catch {
+      /* best-effort */
     }
   }
   return { timezone: "America/Bogota", jobs: local, facebook_scheduled };
@@ -780,20 +785,24 @@ export async function cancelScheduled(
       await yt.deleteVideo(job.post_id);
     }
     if (job.path === "graph_native" && job.post_id) {
-      const client = metaClient(deps);
+      const client = metaClient(deps, job.brand);
       await client.delete(job.post_id);
     }
     const updated = store.update(id, { status: "cancelled" });
     return { cancelled: true, status: updated.status, id, brand: updated.brand, path: updated.path };
   }
 
-  try {
-    const client = metaClient(deps);
-    await client.delete(id);
-    return { cancelled: true, status: "cancelled", id, path: "graph_native" };
-  } catch {
-    throw new Error(`schedule_not_found: ${id}`);
+  if (deps.client) {
+    try {
+      await deps.client.delete(id);
+      return { cancelled: true, status: "cancelled", id, path: "graph_native" };
+    } catch {
+      throw new Error(`schedule_not_found: ${id}`);
+    }
   }
+  throw new Error(
+    `schedule_not_found: ${id}. brand is required to resolve a Meta portfolio token for a Facebook-native cancel. Never cross-brand.`,
+  );
 }
 
 export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() ?? new Date()) {
@@ -841,11 +850,17 @@ export async function listCollaborators(
 ) {
   const mediaId = args.media_id.trim();
   if (!mediaId) throw new Error("media_id is required (published IG media id)");
-  const client = metaClient(deps);
+  const brand = args.brand ? resolveBrand(args.brand) : undefined;
+  if (!deps.client && !brand) {
+    throw new Error(
+      "brand is required to resolve the Meta portfolio token for collaborator lookup. Never cross-brand.",
+    );
+  }
+  const client = brand ? metaClient(deps, brand) : deps.client!;
   const data = await listIgCollaborators(client, mediaId);
   return {
     media_id: mediaId,
-    brand: args.brand ? resolveBrand(args.brand) : undefined,
+    brand,
     collaborators: (data as { data?: unknown }).data ?? data,
     note: "Instagram Graph only. If an invite is missing or failed, use Meta Business Suite as fallback.",
   };
