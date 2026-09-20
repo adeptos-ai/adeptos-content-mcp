@@ -16,6 +16,7 @@ Do **not** use this server to replace Opus Clip for long-form clipping. Do **not
 - **Stack:** Node 20+, TypeScript, `@modelcontextprotocol/sdk`
 - **Transports:** Express Streamable HTTP + stdio
 - **Brands:** `hamill` · `zono` · `adeptos` (one brand per call; never cross-brand)
+- **Meta portfolios:** **two** Business Managers — Ryan Hamill BM (`hamill` + `adeptos` share one token) and ZONO BM (`zono` has its own). There is no third Adeptos-only BM token.
 - **Safety:** every publish / schedule / cancel needs `confirm: true`. Without it you get a dry-run preview. Ryan approves in chat first.
 - **Timezone:** naive `publish_at` is **America/Bogotá** (converted to UTC). Soft slots 09 / 12 / 15 / 18 / 21.
 - **Entity:** ADEPTOS AI LLC product path only.
@@ -79,16 +80,33 @@ Unaudited TikTok apps can only Direct Post as `SELF_ONLY`. Unaudited YouTube API
 
 Never paste tokens in Slack. Never commit `.env`. Tokens are never logged.
 
-### Meta — Leonardo (`Rec0C3QKVTL0Y`)
+### Meta — Leonardo (`Rec0C3QKVTL0Y`) — two Business Managers
 
-System User or long-lived User token with Page access.
+Content MCP uses **two** portfolios, not three. Mint one token per BM. Never put the Hamill token on Zono (or the reverse).
 
-Scopes: `instagram_basic`, `instagram_content_publish`, `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `business_management` if multi-BM.
+| Portfolio | Owns | Brands that share the token |
+|-----------|------|-----------------------------|
+| **Ryan Hamill** BM | Hamill + Adeptos AI Instagram/Page assets | `hamill`, `adeptos` |
+| **ZONO** BM | Zono Instagram/Page assets | `zono` |
 
-Discover IDs:
+Resolution when a tool call is scoped to a brand (never cross-brand):
+
+1. Prefer `BRAND_{BRAND}_META_ACCESS_TOKEN` if set
+2. Else **hamill** / **adeptos**: `META_ACCESS_TOKEN` or `META_HAMILL_ACCESS_TOKEN` (Ryan Hamill portfolio aliases)
+3. Else **zono**: `META_ZONO_ACCESS_TOKEN` or `BRAND_ZONO_META_ACCESS_TOKEN`
+
+Adeptos does **not** need a third Adeptos-only BM token. If the shared Ryan Hamill token is set (`META_ACCESS_TOKEN` or `META_HAMILL_ACCESS_TOKEN`), both `hamill` and `adeptos` are token-ready. Missing-token errors name the env keys for that brand/portfolio.
+
+Scopes: `instagram_basic`, `instagram_content_publish`, `pages_show_list`, `pages_read_engagement`, `pages_manage_posts`, `business_management` if the System User spans both BMs.
+
+Discover IDs **per portfolio token**:
 
 ```bash
+# Ryan Hamill BM (hamill + adeptos)
 curl -s "https://graph.facebook.com/v21.0/me/accounts?fields=id,name,instagram_business_account{id,username}&access_token=$META_ACCESS_TOKEN"
+
+# ZONO BM
+curl -s "https://graph.facebook.com/v21.0/me/accounts?fields=id,name,instagram_business_account{id,username}&access_token=$META_ZONO_ACCESS_TOKEN"
 ```
 
 Set `BRAND_*_IG_USER_ID` and `BRAND_*_PAGE_ID` for hamill / zono / adeptos.
@@ -153,6 +171,8 @@ Cursor / Grok Bot `mcp.json` (stdio):
       "args": ["/absolute/path/to/adeptos-content-mcp/dist/index.js", "--stdio"],
       "env": {
         "META_ACCESS_TOKEN": "",
+        "META_HAMILL_ACCESS_TOKEN": "",
+        "META_ZONO_ACCESS_TOKEN": "",
         "META_GRAPH_VERSION": "v21.0",
         "BRAND_HAMILL_IG_USER_ID": "",
         "BRAND_HAMILL_PAGE_ID": "",
@@ -179,16 +199,19 @@ Env keys for **Meta live proof** (names only — values stay in local `.env` / p
 
 | Key | Role |
 |-----|------|
-| `META_ACCESS_TOKEN` | System User or long-lived User token with Page access |
+| `META_ACCESS_TOKEN` | Ryan Hamill BM token (shared by `hamill` + `adeptos`) |
+| `META_HAMILL_ACCESS_TOKEN` | Alias for the same Ryan Hamill portfolio token |
+| `BRAND_HAMILL_META_ACCESS_TOKEN` / `BRAND_ADEPTOS_META_ACCESS_TOKEN` | Optional per-brand override; not a third BM |
+| `META_ZONO_ACCESS_TOKEN` / `BRAND_ZONO_META_ACCESS_TOKEN` | ZONO BM token (`zono` only) |
 | `META_GRAPH_VERSION` | default `v21.0` |
 | `BRAND_HAMILL_IG_USER_ID` / `BRAND_HAMILL_PAGE_ID` | Hamill IG Business + FB Page |
 | `BRAND_ZONO_IG_USER_ID` / `BRAND_ZONO_PAGE_ID` | Zono |
-| `BRAND_ADEPTOS_IG_USER_ID` / `BRAND_ADEPTOS_PAGE_ID` | Adeptos |
+| `BRAND_ADEPTOS_IG_USER_ID` / `BRAND_ADEPTOS_PAGE_ID` | Adeptos (same Ryan Hamill BM as Hamill) |
 | `BRAND_*_NAME` | optional display name |
 
-Token scopes: `instagram_basic`, `instagram_content_publish`, `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` (`business_management` if multi-BM). Leonardo owns mint + brand map (`Rec0C3QKVTL0Y`).
+Token scopes: `instagram_basic`, `instagram_content_publish`, `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` (`business_management` if the System User spans both BMs). Leonardo owns mint + brand map (`Rec0C3QKVTL0Y`).
 
-Brand map shape: `hamill` \| `zono` \| `adeptos` → `{ ig_user_id, page_id }`. One brand per tool call.
+Brand map shape: `hamill` \| `zono` \| `adeptos` → `{ ig_user_id, page_id }`. One brand per tool call. Writes still need `confirm: true`.
 
 ### Streamable HTTP (optional, port **3848**)
 
