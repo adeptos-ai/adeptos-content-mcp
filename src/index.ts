@@ -6,6 +6,7 @@
  *   npm run start:stdio
  */
 
+import "./load-env.js";
 import express from "express";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";

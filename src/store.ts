@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { BrandKey, MediaRecord, ScheduleJob, ScheduleStatus } from "./types.js";
 
@@ -17,7 +17,17 @@ function readJson<T>(file: string, fallback: T): T {
 
 function writeJson(file: string, value: unknown): void {
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify(value, null, 2) + "\n", "utf8");
+  // Hotfix 2026-10-06: atomic write (temp file in the same dir + rename) so a concurrent reader in
+  // another MCP instance never sees a truncated/empty file and falls back to [] (which the next
+  // write would persist, wiping every job). Not a lock: concurrent read-modify-write can still race.
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf8");
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 export class MediaRegistry {

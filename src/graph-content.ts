@@ -150,6 +150,7 @@ export async function getIgUser(
   };
 }
 
+/** Page metadata. Response stays redacted (access_token comes back as "[REDACTED]"); use getPageToken() for the token. */
 export async function getPage(
   client: MetaClient,
   pageId: string,
@@ -165,13 +166,19 @@ export async function getPage(
 }
 
 export async function getPageToken(client: MetaClient, pageId: string): Promise<string> {
-  const page = await getPage(client, pageId);
-  if (!page.access_token) {
+  // raw:true — the body carries the Page token we need; default redaction would return "[REDACTED]".
+  // The raw body never leaves this function; only the token string goes to client.withToken().
+  const page = (await client.get(pageId, { fields: "id,access_token" }, { raw: true })) as {
+    id?: string;
+    access_token?: string;
+  };
+  const token = typeof page?.access_token === "string" ? page.access_token.trim() : "";
+  if (!token || token.startsWith("[REDACTED")) {
     throw new Error(
       `No Page access token for ${pageId}. System User needs pages_manage_posts on this Page.`,
     );
   }
-  return page.access_token;
+  return token;
 }
 
 export async function publishFbPhoto(
