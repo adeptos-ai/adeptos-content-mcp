@@ -1,6 +1,7 @@
 /**
  * Instagram Content Publishing + Facebook Page feed helpers.
- * Graph has no native IG scheduled_publish_time — containers expire in 24h.
+ * Graph has no native IG scheduled_publish_time — containers expire after ~24h,
+ * so scheduled posts rebuild containers from stored media URLs at publish time.
  */
 
 import { applyCollaborators, refuseStoriesCollaborators } from "./collaborators.js";
@@ -128,6 +129,109 @@ export async function createIgCarouselContainer(
   if (opts.caption) body.caption = opts.caption;
   applyCollaborators(body, opts.collaborators);
   return client.post<GraphId>(`${igUserId}/media`, body, { dryRun: opts.dryRun });
+}
+
+export type IgMediaSpec = {
+  media_type: MediaType;
+  url: string;
+  cover_url?: string;
+};
+
+function graphIdOf(value: unknown, what: string): string {
+  if (
+    value &&
+    typeof value === "object" &&
+    "id" in value &&
+    typeof (value as { id: unknown }).id === "string" &&
+    (value as { id: string }).id
+  ) {
+    return (value as { id: string }).id;
+  }
+  throw new Error(`Graph did not return ${what}`);
+}
+
+/**
+ * Create IG container(s) from media URLs and publish them.
+ * Carousel: each child (no caption, no collaborators) → wait FINISHED → parent with caption
+ * and collaborators → wait FINISHED → media_publish.
+ * Single image or video: create → wait FINISHED → media_publish.
+ * Does not accept or reuse an existing container id.
+ */
+export async function publishIgFromSpec(
+  client: MetaClient,
+  igUserId: string,
+  opts: {
+    media: IgMediaSpec[];
+    caption?: string;
+    collaborators?: string[];
+    waitForReady?: boolean;
+    timeoutMs?: number;
+    intervalMs?: number;
+  },
+): Promise<{ id: string; container_id: string }> {
+  const media = opts.media.filter((item) => item.url?.trim());
+  if (media.length === 0) {
+    throw new Error(
+      "ig_rebuild_missing_media: scheduled Instagram post has no media URLs. Refusing to reuse a stored container id (containers expire after ~24h).",
+    );
+  }
+  if (media.length > 10) throw new Error("IG carousel requires 2–10 media items");
+
+  const wait = opts.waitForReady !== false;
+  const waitOpts = {
+    timeoutMs: opts.timeoutMs ?? 180_000,
+    intervalMs: opts.intervalMs ?? 3_000,
+  };
+
+  let creationId: string;
+  if (media.length === 1) {
+    const item = media[0];
+    const created =
+      item.media_type === "photo"
+        ? await createIgImageContainer(client, igUserId, {
+            imageUrl: item.url,
+            caption: opts.caption,
+            collaborators: opts.collaborators,
+          })
+        : await createIgVideoContainer(client, igUserId, {
+            videoUrl: item.url,
+            caption: opts.caption,
+            mediaType: item.media_type === "video" ? "video" : "reels",
+            coverUrl: item.cover_url,
+            collaborators: opts.collaborators,
+          });
+    creationId = graphIdOf(created, "an IG container id");
+    if (wait) await waitForContainer(client, creationId, waitOpts);
+  } else {
+    const childIds: string[] = [];
+    for (const item of media) {
+      const created =
+        item.media_type === "photo"
+          ? await createIgImageContainer(client, igUserId, {
+              imageUrl: item.url,
+              isCarouselItem: true,
+            })
+          : await createIgVideoContainer(client, igUserId, {
+              videoUrl: item.url,
+              isCarouselItem: true,
+              coverUrl: item.cover_url,
+              mediaType: "video",
+            });
+      const childId = graphIdOf(created, "a carousel child container id");
+      if (wait) await waitForContainer(client, childId, waitOpts);
+      childIds.push(childId);
+    }
+    const parent = await createIgCarouselContainer(client, igUserId, {
+      children: childIds,
+      caption: opts.caption,
+      collaborators: opts.collaborators,
+    });
+    creationId = graphIdOf(parent, "a carousel container id");
+    if (wait) await waitForContainer(client, creationId, waitOpts);
+  }
+
+  const published = await publishIgContainer(client, igUserId, creationId);
+  return { id: graphIdOf(published, "an IG media id"), container_id: creationId };
 }
 
 export async function publishIgContainer(

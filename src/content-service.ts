@@ -26,6 +26,7 @@ import {
   publishFbPhoto,
   publishFbVideo,
   publishIgContainer,
+  publishIgFromSpec,
   waitForContainer,
 } from "./graph-content.js";
 import { resolveSource } from "./http-media.js";
@@ -34,6 +35,7 @@ import { limitsList } from "./media-limits.js";
 import { createMetaClientFromEnv, createMetaClientOptional, type MetaClient } from "./meta-client.js";
 import { missingMetaTokenError } from "./meta-tokens.js";
 import { normalizePlatforms, schedulePathFor } from "./platforms.js";
+import { withTransientRetries } from "./retry.js";
 import { requireConfirm, type WriteSafetyArgs } from "./safety.js";
 import { MediaRegistry, ScheduleStore, newScheduleId } from "./store.js";
 import { TikTokClient } from "./tiktok-client.js";
@@ -41,6 +43,7 @@ import { formatBogota, formatUtc, parsePublishAt, toUnixSeconds } from "./timezo
 import type {
   BrandAccount,
   BrandKey,
+  JobMedia,
   MediaRecord,
   MediaType,
   PlatformAccount,
@@ -59,7 +62,37 @@ export type ServiceDeps = {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   waitForReady?: boolean;
+  /** Override for tests. Defaults to CONTENT_IG_PUBLISH_MAX_ATTEMPTS or 3. */
+  igMaxAttempts?: number;
+  /** Override for tests. Defaults to CONTENT_IG_PUBLISH_RETRY_BASE_MS or 1000. */
+  igRetryBaseMs?: number;
+  igWaitTimeoutMs?: number;
+  igWaitIntervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 };
+
+export class JobCancelledError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`job_cancelled: ${jobId}`);
+    this.name = "JobCancelledError";
+  }
+}
+
+function positiveInt(raw: string | undefined, fallback: number, min: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= min ? Math.floor(n) : fallback;
+}
+
+export function igPublishMaxAttempts(deps?: ServiceDeps): number {
+  if (deps?.igMaxAttempts !== undefined) return Math.max(1, Math.floor(deps.igMaxAttempts));
+  return positiveInt(process.env.CONTENT_IG_PUBLISH_MAX_ATTEMPTS, 3, 1);
+}
+
+export function igPublishRetryBaseMs(deps?: ServiceDeps): number {
+  if (deps?.igRetryBaseMs !== undefined) return Math.max(0, deps.igRetryBaseMs);
+  return positiveInt(process.env.CONTENT_IG_PUBLISH_RETRY_BASE_MS, 1000, 0);
+}
 
 function mediaStore(deps?: ServiceDeps): MediaRegistry {
   return deps?.media ?? MediaRegistry.create();
@@ -229,6 +262,7 @@ export async function uploadMedia(
     ig_user_id: igUserId,
     platforms,
     collaborators: igCollabs.length ? igCollabs : undefined,
+    cover_url: args.cover_url,
   });
 
   return {
@@ -303,7 +337,13 @@ export async function createCarousel(
   };
 }
 
-type ResolvedMedia = { media_type: MediaType; url: string; media_id?: string };
+type ResolvedMedia = JobMedia;
+
+function pushUnique(media: ResolvedMedia[], item: ResolvedMedia): void {
+  const key = `${item.media_type}|${item.url}`;
+  if (media.some((existing) => `${existing.media_type}|${existing.url}` === key)) return;
+  media.push(item);
+}
 
 function resolveJobMedia(
   args: {
@@ -325,17 +365,40 @@ function resolveJobMedia(
 
   for (const id of ids) {
     const rec = registry.get(id);
-    if (rec) {
-      assertSameBrand(args.brand, rec.brand, id);
-      if (rec.child_urls?.length) {
-        for (const url of rec.child_urls) media.push({ media_type: "photo", url, media_id: id });
-      } else if (rec.url) {
-        media.push({ media_type: rec.media_type, url: rec.url, media_id: rec.media_id });
+    if (!rec) continue;
+    assertSameBrand(args.brand, rec.brand, id);
+    if (rec.child_ids?.length) {
+      let pushed = 0;
+      for (const childId of rec.child_ids) {
+        const child = registry.get(childId);
+        if (!child?.url) continue;
+        pushUnique(media, {
+          media_type: child.media_type,
+          url: child.url,
+          media_id: child.media_id,
+          cover_url: child.cover_url,
+        });
+        pushed += 1;
       }
+      if (pushed > 0) continue;
+    }
+    if (rec.child_urls?.length) {
+      for (const url of rec.child_urls) {
+        pushUnique(media, { media_type: "photo", url, media_id: id });
+      }
+    } else if (rec.url) {
+      pushUnique(media, {
+        media_type: rec.media_type,
+        url: rec.url,
+        media_id: rec.media_id,
+        cover_url: rec.cover_url,
+      });
     }
   }
-  if (args.image_url) media.push({ media_type: "photo", url: args.image_url.trim() });
-  if (args.video_url) media.push({ media_type: detectMediaType(args.video_url, "video"), url: args.video_url.trim() });
+  if (args.image_url) pushUnique(media, { media_type: "photo", url: args.image_url.trim() });
+  if (args.video_url) {
+    pushUnique(media, { media_type: detectMediaType(args.video_url, "video"), url: args.video_url.trim() });
+  }
 
   return { containerId: args.container_id || args.media_id, media };
 }
@@ -520,7 +583,7 @@ async function executePlatform(opts: {
       publish_at_bogota: opts.publishAtBogota,
       caption: opts.caption,
       title: opts.title,
-      container_id: opts.containerId,
+      // IG containers expire ~24h after create. Store the build spec only; publish recreates them.
       media_ids: media.map((m) => m.media_id).filter((id): id is string => Boolean(id)),
       media,
       also_post_fb: platform === "meta_fb",
@@ -552,41 +615,41 @@ async function executePlatform(opts: {
   if (platform === "meta_ig") {
     const cfg = requireMetaIg(brand);
     const client = metaClient(opts.deps, brand);
-    let creation = opts.containerId;
-    if (!creation) {
-      const first = media[0];
-      const uploaded = await uploadMedia(
-        {
-          brand,
-          image_url: first.media_type === "photo" ? first.url : undefined,
-          video_url: first.media_type !== "photo" ? first.url : undefined,
-          media_type: first.media_type,
-          caption: opts.caption,
-          platforms: ["meta_ig"],
-          collaborators: opts.collaborators,
-        },
-        opts.deps,
-      );
-      creation = uploaded.media_id;
-    }
-    if (opts.deps.waitForReady !== false) {
-      await waitForContainer(client, creation, { timeoutMs: 180_000 });
-    }
-    const published = (await publishIgContainer(client, cfg.igUserId!, creation)) as { id?: string };
-    let invites: PlatformResult["collaborator_invites"];
-    if (published.id && opts.collaborators?.length) {
-      try {
-        const listed = (await listIgCollaborators(client, published.id)) as { data?: PlatformResult["collaborator_invites"] };
-        invites = listed.data;
-      } catch {
-        invites = opts.collaborators.map((username) => ({ username, invite_status: "unknown" }));
+    // A container id passed on publish_now is one we just created (upload / create carousel).
+    // Scheduled jobs never take this branch: they rebuild from URLs in publishScheduledInstagram.
+    if (opts.containerId) {
+      const creation = opts.containerId;
+      if (opts.deps.waitForReady !== false) {
+        await waitForContainer(client, creation, {
+          timeoutMs: opts.deps.igWaitTimeoutMs ?? 180_000,
+          intervalMs: opts.deps.igWaitIntervalMs ?? 3_000,
+        });
       }
+      const published = (await publishIgContainer(client, cfg.igUserId!, creation)) as { id?: string };
+      const invites = await readCollaboratorInvites(client, published.id, opts.collaborators);
+      return {
+        platform,
+        status: "published",
+        path: "graph_native",
+        post_id: published.id,
+        collaborators: opts.collaborators?.length ? opts.collaborators : undefined,
+        collaborator_invites: invites,
+      };
     }
+    const built = await publishIgFromSpec(client, cfg.igUserId!, {
+      media,
+      caption: opts.caption,
+      collaborators: opts.collaborators,
+      waitForReady: opts.deps.waitForReady !== false,
+      timeoutMs: opts.deps.igWaitTimeoutMs,
+      intervalMs: opts.deps.igWaitIntervalMs,
+    });
+    const invites = await readCollaboratorInvites(client, built.id, opts.collaborators);
     return {
       platform,
       status: "published",
       path: "graph_native",
-      post_id: published.id,
+      post_id: built.id,
       collaborators: opts.collaborators?.length ? opts.collaborators : undefined,
       collaborator_invites: invites,
     };
@@ -805,6 +868,87 @@ export async function cancelScheduled(
   );
 }
 
+async function readCollaboratorInvites(
+  client: MetaClient,
+  postId: string | undefined,
+  collaborators?: string[],
+): Promise<PlatformResult["collaborator_invites"]> {
+  if (!postId || !collaborators?.length) return undefined;
+  try {
+    const listed = (await listIgCollaborators(client, postId)) as {
+      data?: PlatformResult["collaborator_invites"];
+    };
+    return listed.data;
+  } catch {
+    return collaborators.map((username) => ({ username, invite_status: "unknown" }));
+  }
+}
+
+/**
+ * Publish a scheduled Instagram job by creating containers now.
+ * Any container_id stored on the job is ignored (it may have expired).
+ * Transient Graph errors retry with backoff; attempts and the last error are written on the job.
+ * The post id is saved as soon as media_publish succeeds.
+ */
+export async function publishScheduledInstagram(
+  job: ScheduleJob,
+  deps: ServiceDeps,
+  now = deps.now?.() ?? new Date(),
+): Promise<PlatformResult> {
+  const cfg = requireMetaIg(job.brand);
+  const client = metaClient(deps, job.brand);
+  const store = scheduleStore(deps);
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+  const built = await withTransientRetries({
+    maxAttempts: igPublishMaxAttempts(deps),
+    baseDelayMs: igPublishRetryBaseMs(deps),
+    sleep,
+    onAttempt: (attempt, error) => {
+      const fresh = store.get(job.id);
+      if (!fresh || fresh.status === "cancelled") return;
+      store.update(job.id, { attempts: attempt, error });
+    },
+    run: async () => {
+      const fresh = store.get(job.id);
+      if (fresh?.status === "cancelled") throw new JobCancelledError(job.id);
+      return publishIgFromSpec(client, cfg.igUserId!, {
+        media: job.media ?? [],
+        caption: job.caption,
+        collaborators: job.collaborators,
+        waitForReady: deps.waitForReady !== false,
+        timeoutMs: deps.igWaitTimeoutMs,
+        intervalMs: deps.igWaitIntervalMs,
+      });
+    },
+  });
+
+  // Persist the post id before any follow-up Graph read (collaborator invites).
+  const saved = store.get(job.id);
+  if (saved?.status === "cancelled") {
+    store.update(job.id, {
+      post_id: built.id,
+      error: saved.error || "published_after_cancel",
+    });
+  } else if (saved) {
+    store.update(job.id, {
+      status: "published",
+      post_id: built.id,
+      published_at: now.toISOString(),
+      error: undefined,
+    });
+  }
+  const invites = await readCollaboratorInvites(client, built.id, job.collaborators);
+  return {
+    platform: "meta_ig",
+    status: "published",
+    path: "mcp_cron",
+    post_id: built.id,
+    collaborators: job.collaborators?.length ? job.collaborators : undefined,
+    collaborator_invites: invites,
+  };
+}
+
 export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() ?? new Date()) {
   const store = scheduleStore(deps);
   const due = store.due(now);
@@ -813,11 +957,15 @@ export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() 
     if (job.path !== "mcp_cron") continue;
     store.update(job.id, { status: "publishing" });
     try {
+      if (job.platform === "meta_ig") {
+        const published = await publishScheduledInstagram(job, deps, now);
+        results.push({ id: job.id, ...published });
+        continue;
+      }
       const published = await executePlatform({
         platform: job.platform,
         brand: job.brand,
         media: job.media ?? [],
-        containerId: job.container_id,
         caption: job.caption,
         title: job.title,
         collaborators: job.collaborators,
@@ -828,16 +976,35 @@ export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() 
         deps,
         registry: mediaStore(deps),
       });
+      const fresh = store.get(job.id);
+      if (fresh?.status === "cancelled") {
+        results.push({ id: job.id, status: "cancelled" });
+        continue;
+      }
       store.update(job.id, {
-        status: published.status === "error" ? "failed" : "published",
+        status: published.status === "error" || published.status === "skipped" ? "failed" : "published",
         post_id: published.post_id,
         published_at: now.toISOString(),
         error: published.error,
+        attempts: (job.attempts ?? 0) + 1,
       });
       results.push({ id: job.id, ...published });
     } catch (err) {
+      if (err instanceof JobCancelledError) {
+        results.push({ id: job.id, status: "cancelled" });
+        continue;
+      }
       const message = err instanceof Error ? err.message : String(err);
-      store.update(job.id, { status: "failed", error: message });
+      const fresh = store.get(job.id);
+      if (fresh?.status === "cancelled") {
+        results.push({ id: job.id, status: "cancelled" });
+        continue;
+      }
+      store.update(job.id, {
+        status: "failed",
+        error: message,
+        attempts: fresh?.attempts ?? (job.attempts ?? 0) + 1,
+      });
       results.push({ id: job.id, status: "failed", error: message });
     }
   }

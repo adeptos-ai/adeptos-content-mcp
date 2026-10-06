@@ -61,7 +61,7 @@ Hamill / Zono / Adeptos cross-brand collabs are the intended use (e.g. Hamill po
 
 | Platform | Photo | Carousel / multi | Video / mp4 | Schedule path |
 |----------|-------|------------------|-------------|---------------|
-| **Instagram** (`meta_ig`) | yes | 2–10 Graph `CAROUSEL` | Reels / video | `mcp_cron` (Graph has **no** IG schedule; containers expire in 24h) |
+| **Instagram** (`meta_ig`) | yes | 2–10 Graph `CAROUSEL` | Reels / video | `mcp_cron` (Graph has **no** IG schedule). Containers are created **at publish time** from stored media URLs — a container created at booking expires after ~24h and is not reused |
 | **Facebook Page** (`meta_fb`) | yes | 2–10 `attached_media` | Page videos | `graph_native` (`published=false` + `scheduled_publish_time`) |
 | **TikTok** | yes | PHOTO Direct Post `photo_images` (up to 35) | Direct Post `PULL_FROM_URL` | `mcp_cron` (no native schedule) |
 | **YouTube** | **no** | **no** | short mp4 via `videos.insert` | `youtube_native` (`privacyStatus=private` + `publishAt`) |
@@ -73,6 +73,24 @@ Hamill / Zono / Adeptos cross-brand collabs are the intended use (e.g. Hamill po
 **YouTube Data API v3 has no Community post or image-post endpoint.** A photo/carousel job that includes `youtube` is **skipped** with `youtube_community_unsupported`. Opus Clip remains the YouTube clip path. Content MCP will upload a **short mp4** Canva export when `video_url` is set.
 
 Unaudited TikTok apps can only Direct Post as `SELF_ONLY`. Unaudited YouTube API projects force private until Google audit.
+
+### Scheduled Instagram — containers at publish time
+
+Meta media containers expire after about 24 hours. `content_schedule_post` stores the build spec on the job (`media` URLs and type, caption, collaborators) and does **not** store a container id for later. When the job is due, the worker:
+
+1. Single image or video — `POST /{ig-user-id}/media`, poll `status_code` until `FINISHED`, then `media_publish`.
+2. Carousel (2–10) — create each child with `is_carousel_item` (no caption, no collaborators), wait until each is `FINISHED`, create the parent `CAROUSEL` with caption and collaborators, wait until `FINISHED`, then `media_publish`.
+
+A job that already has a legacy `container_id` is rebuilt the same way. The old id is never sent as `creation_id`.
+
+Transient Graph/network errors (HTTP 408, 429, 5xx, timeouts, rate-limit copy) are retried with exponential backoff. Each try writes `attempts` and `error` on the job. When the retries are exhausted the job is `failed`. `media_publish` success writes `post_id` immediately.
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_IG_PUBLISH_MAX_ATTEMPTS` | `3` | Attempts per due IG job, including the first |
+| `CONTENT_IG_PUBLISH_RETRY_BASE_MS` | `1000` | Backoff base. Attempt 2 waits this long; attempt 3 waits twice that |
+
+`publish_now` is unchanged: a container id you just created (upload or carousel) is published immediately. Without a container id, publish-now also builds from the media URLs, including carousels.
 
 ---
 
