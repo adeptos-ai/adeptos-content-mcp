@@ -92,6 +92,29 @@ Transient Graph/network errors (HTTP 408, 429, 5xx, timeouts, rate-limit copy) a
 
 `publish_now` is unchanged: a container id you just created (upload or carousel) is published immediately. Without a container id, publish-now also builds from the media URLs, including carousels.
 
+### One scheduler
+
+Several agents each spawn their own stdio copy and share one `data/schedules.json`. Only **one** process may poll for due jobs. Every other copy can still enqueue, cancel, and list.
+
+The poller starts only when `CONTENT_SCHEDULER_ENABLED=1`. `CONTENT_DISABLE_WORKER=1` turns it off even if the enable flag is set. Leave the enable flag unset on agent stdio servers.
+
+That one process claims each due `mcp_cron` job atomically (`scheduled` → `publishing`, with `owner` and `lease_until`). It re-reads the job immediately before the network call and skips a cancel. The post id is written as soon as publish succeeds. If a job is still `publishing` after the lease, the next tick moves it to `needs_review` and does **not** publish it again.
+
+All store writes take a cross-process lock (`data/store.lock`) and still use a temp file plus rename. A lock whose holder pid is dead, or whose age exceeds `CONTENT_STORE_LOCK_STALE_MS`, is removed. If `schedules.json` or `media.json` exists but is not valid JSON, reads throw `store_parse_error` instead of treating the file as empty (an empty read used to get saved back and wipe the queue).
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_SCHEDULER_ENABLED` | unset | `1` starts the due-job poller in this process only |
+| `CONTENT_DISABLE_WORKER` | unset | `1` kills the poller, including when the enable flag is set |
+| `CONTENT_WORKER_INTERVAL_MS` | `30000` | Poll interval. Values under `5000` are ignored |
+| `CONTENT_PUBLISH_LEASE_MS` | `600000` | How long a claim may stay in `publishing` (minimum `5000`) |
+| `CONTENT_SCHEDULER_OWNER` | `host:pid:random` | Claim owner recorded on the job |
+| `CONTENT_STORE_LOCK_STALE_MS` | `30000` | Age after which a lock held by a live pid is stolen |
+| `CONTENT_STORE_LOCK_TIMEOUT_MS` | `15000` | How long a writer waits for the lock |
+| `CONTENT_DATA_DIR` | `./data` | Directory for `schedules.json` and `media.json` |
+
+Facebook Page posts still use Graph `scheduled_publish_time` when `publish_at` is in the future. Those rows are not claimed by the poller.
+
 ### Durable media (off by default)
 
 There is no media host inside this process today. `content_upload_media` stores the source URL, and TikTok Direct Post sends that URL as `photo_images` / `PULL_FROM_URL`. Signed `fbcdn` links expire within days, and TikTok only pulls URLs on the verified domain `adeptos.ai`.
@@ -272,7 +295,7 @@ npm run start:http
 }
 ```
 
-The HTTP process also runs the `mcp_cron` worker (~30s) so IG schedules fire. Facebook uses Graph native schedule when `publish_at` is set.
+Do **not** turn the poller on for every HTTP or stdio process. Set `CONTENT_SCHEDULER_ENABLED=1` on exactly one of them (see [One scheduler](#one-scheduler)). Facebook still uses Graph native schedule when `publish_at` is set.
 
 ---
 

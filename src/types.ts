@@ -52,7 +52,13 @@ export type JobMedia = {
   cover_url?: string;
 };
 
-export type ScheduleStatus = "scheduled" | "publishing" | "published" | "cancelled" | "failed";
+export type ScheduleStatus =
+  | "scheduled"
+  | "publishing"
+  | "published"
+  | "cancelled"
+  | "failed"
+  | "needs_review";
 
 export type SchedulePath = "mcp_cron" | "graph_native" | "youtube_native";
 
@@ -83,6 +89,10 @@ export type ScheduleJob = {
   error?: string;
   /** Publish attempts for this job (including the last failure). */
   attempts?: number;
+  /** Process that moved the job to publishing. */
+  owner?: string;
+  /** ISO time. After this, a still-publishing job becomes needs_review and is not retried. */
+  lease_until?: string;
   confirm: true;
 };
 

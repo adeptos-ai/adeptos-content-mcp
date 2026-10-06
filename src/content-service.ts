@@ -31,6 +31,7 @@ import {
 } from "./graph-content.js";
 import { fetchBytes, resolveSource } from "./http-media.js";
 import { mediaStorageFromEnv, type MediaStorage } from "./media-storage.js";
+import { publishLeaseMs, schedulerOwner } from "./scheduler-config.js";
 import { LinkedInClient } from "./linkedin-client.js";
 import { limitsList } from "./media-limits.js";
 import { createMetaClientFromEnv, createMetaClientOptional, type MetaClient } from "./meta-client.js";
@@ -72,7 +73,18 @@ export type ServiceDeps = {
   sleep?: (ms: number) => Promise<void>;
   /** Durable host. Undefined reads CONTENT_MEDIA_STORAGE (default off). Null forces off. */
   storage?: MediaStorage | null;
+  owner?: string;
+  leaseMs?: number;
+  /** Test seam: runs after a job is claimed and before the network publish. */
+  beforePublish?: (job: ScheduleJob) => void;
 };
+
+export class ClaimLostError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`claim_lost: ${jobId}`);
+    this.name = "ClaimLostError";
+  }
+}
 
 export class JobCancelledError extends Error {
   constructor(public readonly jobId: string) {
@@ -925,10 +937,20 @@ async function readCollaboratorInvites(
  * Transient Graph errors retry with backoff; attempts and the last error are written on the job.
  * The post id is saved as soon as media_publish succeeds.
  */
+function assertStillClaimed(store: ScheduleStore, jobId: string, owner: string): ScheduleJob {
+  const fresh = store.get(jobId);
+  if (!fresh || fresh.status === "cancelled") throw new JobCancelledError(jobId);
+  if (fresh.owner !== owner || (fresh.status !== "publishing" && fresh.status !== "needs_review")) {
+    throw new ClaimLostError(jobId);
+  }
+  return fresh;
+}
+
 export async function publishScheduledInstagram(
   job: ScheduleJob,
   deps: ServiceDeps,
   now = deps.now?.() ?? new Date(),
+  owner = job.owner ?? deps.owner ?? schedulerOwner(),
 ): Promise<PlatformResult> {
   const cfg = requireMetaIg(job.brand);
   const client = metaClient(deps, job.brand);
@@ -940,13 +962,10 @@ export async function publishScheduledInstagram(
     baseDelayMs: igPublishRetryBaseMs(deps),
     sleep,
     onAttempt: (attempt, error) => {
-      const fresh = store.get(job.id);
-      if (!fresh || fresh.status === "cancelled") return;
-      store.update(job.id, { attempts: attempt, error });
+      store.recordAttempt(job.id, owner, attempt, error);
     },
     run: async () => {
-      const fresh = store.get(job.id);
-      if (fresh?.status === "cancelled") throw new JobCancelledError(job.id);
+      assertStillClaimed(store, job.id, owner);
       return publishIgFromSpec(client, cfg.igUserId!, {
         media: job.media ?? [],
         caption: job.caption,
@@ -959,20 +978,12 @@ export async function publishScheduledInstagram(
   });
 
   // Persist the post id before any follow-up Graph read (collaborator invites).
-  const saved = store.get(job.id);
-  if (saved?.status === "cancelled") {
-    store.update(job.id, {
-      post_id: built.id,
-      error: saved.error || "published_after_cancel",
-    });
-  } else if (saved) {
-    store.update(job.id, {
-      status: "published",
-      post_id: built.id,
-      published_at: now.toISOString(),
-      error: undefined,
-    });
-  }
+  store.finishPublish(job.id, owner, {
+    status: "published",
+    post_id: built.id,
+    published_at: now.toISOString(),
+    error: undefined,
+  });
   const invites = await readCollaboratorInvites(client, built.id, job.collaborators);
   return {
     platform: "meta_ig",
@@ -986,14 +997,18 @@ export async function publishScheduledInstagram(
 
 export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() ?? new Date()) {
   const store = scheduleStore(deps);
-  const due = store.due(now);
+  const owner = deps.owner ?? schedulerOwner();
+  const leaseMs = deps.leaseMs ?? publishLeaseMs();
+  store.expireLeases(now);
   const results: Array<Record<string, unknown>> = [];
-  for (const job of due) {
-    if (job.path !== "mcp_cron") continue;
-    store.update(job.id, { status: "publishing" });
+  for (;;) {
+    const job = store.claimDue(now, owner, leaseMs);
+    if (!job) break;
     try {
+      deps.beforePublish?.(job);
+      assertStillClaimed(store, job.id, owner);
       if (job.platform === "meta_ig") {
-        const published = await publishScheduledInstagram(job, deps, now);
+        const published = await publishScheduledInstagram(job, deps, now, owner);
         results.push({ id: job.id, ...published });
         continue;
       }
@@ -1011,22 +1026,21 @@ export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() 
         deps,
         registry: mediaStore(deps),
       });
-      const fresh = store.get(job.id);
-      if (fresh?.status === "cancelled") {
-        results.push({ id: job.id, status: "cancelled" });
-        continue;
-      }
-      store.update(job.id, {
+      const finished = store.finishPublish(job.id, owner, {
         status: published.status === "error" || published.status === "skipped" ? "failed" : "published",
         post_id: published.post_id,
         published_at: now.toISOString(),
         error: published.error,
         attempts: (job.attempts ?? 0) + 1,
       });
+      if (finished?.status === "cancelled") {
+        results.push({ id: job.id, status: "cancelled", post_id: finished.post_id });
+        continue;
+      }
       results.push({ id: job.id, ...published });
     } catch (err) {
-      if (err instanceof JobCancelledError) {
-        results.push({ id: job.id, status: "cancelled" });
+      if (err instanceof JobCancelledError || err instanceof ClaimLostError) {
+        results.push({ id: job.id, status: err instanceof JobCancelledError ? "cancelled" : "skipped" });
         continue;
       }
       const message = err instanceof Error ? err.message : String(err);
@@ -1035,7 +1049,7 @@ export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() 
         results.push({ id: job.id, status: "cancelled" });
         continue;
       }
-      store.update(job.id, {
+      store.finishPublish(job.id, owner, {
         status: "failed",
         error: message,
         attempts: fresh?.attempts ?? (job.attempts ?? 0) + 1,
