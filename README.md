@@ -92,6 +92,29 @@ Transient Graph/network errors (HTTP 408, 429, 5xx, timeouts, rate-limit copy) a
 
 `publish_now` is unchanged: a container id you just created (upload or carousel) is published immediately. Without a container id, publish-now also builds from the media URLs, including carousels.
 
+### Durable media (off by default)
+
+There is no media host inside this process today. `content_upload_media` stores the source URL, and TikTok Direct Post sends that URL as `photo_images` / `PULL_FROM_URL`. Signed `fbcdn` links expire within days, and TikTok only pulls URLs on the verified domain `adeptos.ai`.
+
+Set `CONTENT_MEDIA_STORAGE=github-static` to copy bytes at **booking** time (confirm, not preview) and store the public URL on the job. Unset, `off`, or `0` keeps the source URL. Unknown values throw.
+
+`github-static` commits the file through the GitHub Contents API. The static site [adeptos-ai/landing-adeptos](https://github.com/adeptos-ai/landing-adeptos) serves everything under `public/` at `https://adeptos.ai/<path>` after an auto-deploy on push to `main` (about a minute). The adapter waits until that URL returns HTTP 200 to `HEAD`. Files have to stay in the repo: the site is rebuilt from git, not from a side upload. An S3 or R2 adapter can implement the same `MediaStorage` interface later; this build does not ship one.
+
+TikTok photos must be JPEG or WebP. PNG uploads are converted to JPEG. GIF is rejected.
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_MEDIA_STORAGE` | `off` | `off` or `github-static` |
+| `GITHUB_STATIC_TOKEN` | none | Fine-grained or classic token with **contents: write** on the landing repo. Never commit it |
+| `GITHUB_STATIC_REPO` | `adeptos-ai/landing-adeptos` | `owner/name` |
+| `GITHUB_STATIC_BRANCH` | `main` | Branch that triggers the deploy |
+| `GITHUB_STATIC_PATH_PREFIX` | `public/content-mcp` | Repo directory. The `public/` segment is not part of the public URL |
+| `GITHUB_STATIC_PUBLIC_BASE` | `https://adeptos.ai` | Origin TikTok has verified |
+| `GITHUB_STATIC_WAIT_MS` | `120000` | How long to wait for the deploy to answer HEAD 200 |
+| `GITHUB_STATIC_POLL_MS` | `3000` | Delay between HEAD checks |
+
+Booking blocks until the public URL is live, so a schedule call can take about a minute when hosting is on. URLs already on that origin are not uploaded again. Existing queued jobs are not rewritten by this server; cancel those and book again after hosting is enabled.
+
 ---
 
 ## Auth setup (Leo / Ryan)
@@ -133,7 +156,7 @@ Set `BRAND_*_IG_USER_ID` and `BRAND_*_PAGE_ID` for hamill / zono / adeptos.
 
 Developer app → enable **Direct Post** → scopes `video.publish` (and `video.upload` if you also send inbox drafts). Each brand authorizes the app. Store per-brand `open_id` + access token (or refresh token + `TIKTOK_CLIENT_KEY` / `TIKTOK_CLIENT_SECRET`).
 
-`PULL_FROM_URL` requires the Canva/CDN URL prefix to be verified in the TikTok developer portal.
+`PULL_FROM_URL` only accepts URLs on a domain verified in the TikTok developer portal. For these brands that domain is `adeptos.ai`. With `CONTENT_MEDIA_STORAGE=github-static`, booking copies the file there before TikTok is asked to pull it.
 
 ### YouTube — OAuth refresh token (not a service account)
 

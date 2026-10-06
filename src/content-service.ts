@@ -29,7 +29,8 @@ import {
   publishIgFromSpec,
   waitForContainer,
 } from "./graph-content.js";
-import { resolveSource } from "./http-media.js";
+import { fetchBytes, resolveSource } from "./http-media.js";
+import { mediaStorageFromEnv, type MediaStorage } from "./media-storage.js";
 import { LinkedInClient } from "./linkedin-client.js";
 import { limitsList } from "./media-limits.js";
 import { createMetaClientFromEnv, createMetaClientOptional, type MetaClient } from "./meta-client.js";
@@ -69,6 +70,8 @@ export type ServiceDeps = {
   igWaitTimeoutMs?: number;
   igWaitIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Durable host. Undefined reads CONTENT_MEDIA_STORAGE (default off). Null forces off. */
+  storage?: MediaStorage | null;
 };
 
 export class JobCancelledError extends Error {
@@ -102,6 +105,32 @@ function scheduleStore(deps?: ServiceDeps): ScheduleStore {
 }
 function fetchImpl(deps?: ServiceDeps): typeof fetch {
   return deps?.fetchImpl ?? fetch;
+}
+
+function resolveStorage(deps: ServiceDeps): MediaStorage | null {
+  if (deps.storage !== undefined) return deps.storage;
+  return mediaStorageFromEnv(process.env, fetchImpl(deps), deps.sleep);
+}
+
+async function hostMediaForBooking(media: ResolvedMedia[], deps: ServiceDeps): Promise<ResolvedMedia[]> {
+  const storage = resolveStorage(deps);
+  if (!storage) return media;
+  const download = fetchImpl(deps);
+  const hosted: ResolvedMedia[] = [];
+  for (const item of media) {
+    if (!item.url || storage.isDurable(item.url)) {
+      hosted.push(item);
+      continue;
+    }
+    const file = await fetchBytes(item.url, download);
+    const saved = await storage.put({
+      bytes: file.bytes,
+      contentType: file.contentType,
+      filename: item.url,
+    });
+    hosted.push({ ...item, url: saved.url });
+  }
+  return hosted;
 }
 function metaClient(deps: ServiceDeps | undefined, brand: BrandKey): MetaClient {
   if (deps?.client) return deps.client;
@@ -473,6 +502,11 @@ export async function schedulePost(
   if (igCollaborators.length && !targets.includes("meta_ig")) {
     warnings.push("collaborators apply only to Instagram (meta_ig). Other platforms ignore them.");
   }
+  if (!resolveStorage(deps) && media.some((item) => /fbcdn\.net|scontent/i.test(item.url))) {
+    warnings.push(
+      "media_url_may_expire: a source URL looks like a signed Facebook CDN link. Set CONTENT_MEDIA_STORAGE=github-static to copy it onto adeptos.ai at booking time.",
+    );
+  }
 
   const plan = {
     brand,
@@ -501,6 +535,7 @@ export async function schedulePost(
     return preview;
   }
 
+  const bookedMedia = gate.dryRun ? media : await hostMediaForBooking(media, deps);
   const results: PlatformResult[] = [];
   for (const platform of targets) {
     try {
@@ -508,7 +543,7 @@ export async function schedulePost(
         await executePlatform({
           platform,
           brand,
-          media,
+          media: bookedMedia,
           containerId,
           caption: args.caption,
           title: args.title,
