@@ -320,6 +320,10 @@ Automated (`npm test`):
 - multi-platform photo dry-run
 - mocked confirm publish for Meta IG, TikTok photo, YouTube mp4, LinkedIn MultiImage, X tweet
 - IG collaborators: dry-run echo; confirm media create includes `collaborators`; omit sends no field
+- IG publish-time rebuild (legacy container id ignored, carousel children, video poll, retries)
+- durable media stays off by default; github-static commits JPEG and redacts the token
+- scheduler off unless `CONTENT_SCHEDULER_ENABLED=1`; `CONTENT_DISABLE_WORKER=1` still wins
+- store parse errors throw; two processes cannot double-publish or drop inserts
 
 ---
 
