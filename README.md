@@ -61,7 +61,7 @@ Hamill / Zono / Adeptos cross-brand collabs are the intended use (e.g. Hamill po
 
 | Platform | Photo | Carousel / multi | Video / mp4 | Schedule path |
 |----------|-------|------------------|-------------|---------------|
-| **Instagram** (`meta_ig`) | yes | 2–10 Graph `CAROUSEL` | Reels / video | `mcp_cron` (Graph has **no** IG schedule; containers expire in 24h) |
+| **Instagram** (`meta_ig`) | yes | 2–10 Graph `CAROUSEL` | Reels / video | `mcp_cron` (Graph has **no** IG schedule). Containers are created **at publish time** from stored media URLs — a container created at booking expires after ~24h and is not reused |
 | **Facebook Page** (`meta_fb`) | yes | 2–10 `attached_media` | Page videos | `graph_native` (`published=false` + `scheduled_publish_time`) |
 | **TikTok** | yes | PHOTO Direct Post `photo_images` (up to 35) | Direct Post `PULL_FROM_URL` | `mcp_cron` (no native schedule) |
 | **YouTube** | **no** | **no** | short mp4 via `videos.insert` | `youtube_native` (`privacyStatus=private` + `publishAt`) |
@@ -73,6 +73,70 @@ Hamill / Zono / Adeptos cross-brand collabs are the intended use (e.g. Hamill po
 **YouTube Data API v3 has no Community post or image-post endpoint.** A photo/carousel job that includes `youtube` is **skipped** with `youtube_community_unsupported`. Opus Clip remains the YouTube clip path. Content MCP will upload a **short mp4** Canva export when `video_url` is set.
 
 Unaudited TikTok apps can only Direct Post as `SELF_ONLY`. Unaudited YouTube API projects force private until Google audit.
+
+### Scheduled Instagram — containers at publish time
+
+Meta media containers expire after about 24 hours. `content_schedule_post` stores the build spec on the job (`media` URLs and type, caption, collaborators) and does **not** store a container id for later. When the job is due, the worker:
+
+1. Single image or video — `POST /{ig-user-id}/media`, poll `status_code` until `FINISHED`, then `media_publish`.
+2. Carousel (2–10) — create each child with `is_carousel_item` (no caption, no collaborators), wait until each is `FINISHED`, create the parent `CAROUSEL` with caption and collaborators, wait until `FINISHED`, then `media_publish`.
+
+A job that already has a legacy `container_id` is rebuilt the same way. The old id is never sent as `creation_id`.
+
+Transient Graph/network errors (HTTP 408, 429, 5xx, timeouts, rate-limit copy) are retried with exponential backoff. Each try writes `attempts` and `error` on the job. When the retries are exhausted the job is `failed`. `media_publish` success writes `post_id` immediately.
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_IG_PUBLISH_MAX_ATTEMPTS` | `3` | Attempts per due IG job, including the first |
+| `CONTENT_IG_PUBLISH_RETRY_BASE_MS` | `1000` | Backoff base. Attempt 2 waits this long; attempt 3 waits twice that |
+
+`publish_now` is unchanged: a container id you just created (upload or carousel) is published immediately. Without a container id, publish-now also builds from the media URLs, including carousels.
+
+### One scheduler
+
+Several agents each spawn their own stdio copy and share one `data/schedules.json`. Only **one** process may poll for due jobs. Every other copy can still enqueue, cancel, and list.
+
+The poller starts only when `CONTENT_SCHEDULER_ENABLED=1`. `CONTENT_DISABLE_WORKER=1` turns it off even if the enable flag is set. Leave the enable flag unset on agent stdio servers.
+
+That one process claims each due `mcp_cron` job atomically (`scheduled` → `publishing`, with `owner` and `lease_until`). It re-reads the job immediately before the network call and skips a cancel. The post id is written as soon as publish succeeds. If a job is still `publishing` after the lease, the next tick moves it to `needs_review` and does **not** publish it again.
+
+All store writes take a cross-process lock (`data/store.lock`) and still use a temp file plus rename. A lock whose holder pid is dead, or whose age exceeds `CONTENT_STORE_LOCK_STALE_MS`, is removed. If `schedules.json` or `media.json` exists but is not valid JSON, reads throw `store_parse_error` instead of treating the file as empty (an empty read used to get saved back and wipe the queue).
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_SCHEDULER_ENABLED` | unset | `1` starts the due-job poller in this process only |
+| `CONTENT_DISABLE_WORKER` | unset | `1` kills the poller, including when the enable flag is set |
+| `CONTENT_WORKER_INTERVAL_MS` | `30000` | Poll interval. Values under `5000` are ignored |
+| `CONTENT_PUBLISH_LEASE_MS` | `600000` | How long a claim may stay in `publishing` (minimum `5000`) |
+| `CONTENT_SCHEDULER_OWNER` | `host:pid:random` | Claim owner recorded on the job |
+| `CONTENT_STORE_LOCK_STALE_MS` | `30000` | Age after which a lock held by a live pid is stolen |
+| `CONTENT_STORE_LOCK_TIMEOUT_MS` | `15000` | How long a writer waits for the lock |
+| `CONTENT_DATA_DIR` | `./data` | Directory for `schedules.json` and `media.json` |
+
+Facebook Page posts still use Graph `scheduled_publish_time` when `publish_at` is in the future. Those rows are not claimed by the poller.
+
+### Durable media (off by default)
+
+There is no media host inside this process today. `content_upload_media` stores the source URL, and TikTok Direct Post sends that URL as `photo_images` / `PULL_FROM_URL`. Signed `fbcdn` links expire within days, and TikTok only pulls URLs on the verified domain `adeptos.ai`.
+
+Set `CONTENT_MEDIA_STORAGE=github-static` to copy bytes at **booking** time (confirm, not preview) and store the public URL on the job. Unset, `off`, or `0` keeps the source URL. Unknown values throw.
+
+`github-static` commits the file through the GitHub Contents API. The static site [adeptos-ai/landing-adeptos](https://github.com/adeptos-ai/landing-adeptos) serves everything under `public/` at `https://adeptos.ai/<path>` after an auto-deploy on push to `main` (about a minute). The adapter waits until that URL returns HTTP 200 to `HEAD`. Files have to stay in the repo: the site is rebuilt from git, not from a side upload. An S3 or R2 adapter can implement the same `MediaStorage` interface later; this build does not ship one.
+
+TikTok photos must be JPEG or WebP. PNG uploads are converted to JPEG. GIF is rejected.
+
+| Env | Default | Role |
+|-----|---------|------|
+| `CONTENT_MEDIA_STORAGE` | `off` | `off` or `github-static` |
+| `GITHUB_STATIC_TOKEN` | none | Fine-grained or classic token with **contents: write** on the landing repo. Never commit it |
+| `GITHUB_STATIC_REPO` | `adeptos-ai/landing-adeptos` | `owner/name` |
+| `GITHUB_STATIC_BRANCH` | `main` | Branch that triggers the deploy |
+| `GITHUB_STATIC_PATH_PREFIX` | `public/content-mcp` | Repo directory. The `public/` segment is not part of the public URL |
+| `GITHUB_STATIC_PUBLIC_BASE` | `https://adeptos.ai` | Origin TikTok has verified |
+| `GITHUB_STATIC_WAIT_MS` | `120000` | How long to wait for the deploy to answer HEAD 200 |
+| `GITHUB_STATIC_POLL_MS` | `3000` | Delay between HEAD checks |
+
+Booking blocks until the public URL is live, so a schedule call can take about a minute when hosting is on. URLs already on that origin are not uploaded again. Existing queued jobs are not rewritten by this server; cancel those and book again after hosting is enabled.
 
 ---
 
@@ -115,7 +179,7 @@ Set `BRAND_*_IG_USER_ID` and `BRAND_*_PAGE_ID` for hamill / zono / adeptos.
 
 Developer app → enable **Direct Post** → scopes `video.publish` (and `video.upload` if you also send inbox drafts). Each brand authorizes the app. Store per-brand `open_id` + access token (or refresh token + `TIKTOK_CLIENT_KEY` / `TIKTOK_CLIENT_SECRET`).
 
-`PULL_FROM_URL` requires the Canva/CDN URL prefix to be verified in the TikTok developer portal.
+`PULL_FROM_URL` only accepts URLs on a domain verified in the TikTok developer portal. For these brands that domain is `adeptos.ai`. With `CONTENT_MEDIA_STORAGE=github-static`, booking copies the file there before TikTok is asked to pull it.
 
 ### YouTube — OAuth refresh token (not a service account)
 
@@ -231,7 +295,7 @@ npm run start:http
 }
 ```
 
-The HTTP process also runs the `mcp_cron` worker (~30s) so IG schedules fire. Facebook uses Graph native schedule when `publish_at` is set.
+Do **not** turn the poller on for every HTTP or stdio process. Set `CONTENT_SCHEDULER_ENABLED=1` on exactly one of them (see [One scheduler](#one-scheduler)). Facebook still uses Graph native schedule when `publish_at` is set.
 
 ---
 
@@ -256,6 +320,10 @@ Automated (`npm test`):
 - multi-platform photo dry-run
 - mocked confirm publish for Meta IG, TikTok photo, YouTube mp4, LinkedIn MultiImage, X tweet
 - IG collaborators: dry-run echo; confirm media create includes `collaborators`; omit sends no field
+- IG publish-time rebuild (legacy container id ignored, carousel children, video poll, retries)
+- durable media stays off by default; github-static commits JPEG and redacts the token
+- scheduler off unless `CONTENT_SCHEDULER_ENABLED=1`; `CONTENT_DISABLE_WORKER=1` still wins
+- store parse errors throw; two processes cannot double-publish or drop inserts
 
 ---
 

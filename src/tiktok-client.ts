@@ -4,7 +4,8 @@
  * Never log tokens.
  */
 
-import { loadBrand, type BrandConfig } from "./brands.js";
+import { brandEnvPrefix, loadBrand, type BrandConfig } from "./brands.js";
+import { persistEnvValues, readEnvFileValue } from "./env-persist.js";
 import { redactDeep, redactString, safeErrorMessage } from "./safety.js";
 import type { BrandKey } from "./types.js";
 
@@ -60,12 +61,53 @@ export class TikTokClient {
     return h;
   }
 
+  /** Refreshed at most once per client instance (hotfix 2026-10-06). */
+  private refreshedOnce = false;
+
+  /**
+   * Env keys that hold this brand's tokens. Brand-scoped keys win; falls back to the global
+   * TIKTOK_* keys only when the brand has no refresh token of its own (mirrors loadBrand()).
+   */
+  private tokenEnvKeys(): { access: string; refresh: string } {
+    const prefix = brandEnvPrefix(this.cfg.brand);
+    const brandRefresh = process.env[`${prefix}_TIKTOK_REFRESH_TOKEN`]?.trim();
+    if (!brandRefresh && process.env.TIKTOK_REFRESH_TOKEN?.trim()) {
+      return { access: "TIKTOK_ACCESS_TOKEN", refresh: "TIKTOK_REFRESH_TOKEN" };
+    }
+    return { access: `${prefix}_TIKTOK_ACCESS_TOKEN`, refresh: `${prefix}_TIKTOK_REFRESH_TOKEN` };
+  }
+
+  /**
+   * Exchange the refresh token for a new access token, adopt it, and persist it (plus a rotated
+   * refresh token) to process.env and .env so other clients/instances pick it up.
+   */
+  async refreshAccessToken(): Promise<string> {
+    const keys = this.tokenEnvKeys();
+    // Prefer the on-disk value: another instance may already have rotated the refresh token.
+    const refreshToken = readEnvFileValue(keys.refresh) ?? this.cfg.tiktokRefreshToken;
+    if (!refreshToken) throw new Error("TikTok access token expired/invalid and no refresh token is configured");
+    const refreshed = await refreshTikTokTokenFull(refreshToken, this.fetchImpl);
+    this.accessToken = refreshed.accessToken;
+    this.refreshedOnce = true;
+    const updates: Record<string, string> = { [keys.access]: refreshed.accessToken };
+    if (refreshed.refreshToken && refreshed.refreshToken !== refreshToken) {
+      updates[keys.refresh] = refreshed.refreshToken;
+    }
+    this.cfg.tiktokAccessToken = refreshed.accessToken;
+    if (updates[keys.refresh]) this.cfg.tiktokRefreshToken = updates[keys.refresh];
+    try {
+      persistEnvValues(updates);
+    } catch (err) {
+      // process.env is already updated in persistEnvValues before the file write; keep serving.
+      console.error(`[tiktok] could not persist refreshed token to .env: ${safeErrorMessage(err)}`);
+    }
+    return refreshed.accessToken;
+  }
+
   async ensureAccessToken(): Promise<string> {
     if (this.accessToken) return this.accessToken;
     if (!this.cfg.tiktokRefreshToken) throw new Error("TikTok access token and refresh token are both empty");
-    const refreshed = await refreshTikTokToken(this.cfg.tiktokRefreshToken, this.fetchImpl);
-    this.accessToken = refreshed;
-    return refreshed;
+    return this.refreshAccessToken();
   }
 
   async request<T>(
@@ -78,6 +120,19 @@ export class TikTokClient {
       return { dryRun: true, method, path, body };
     }
     await this.ensureAccessToken();
+    try {
+      return await this.send<T>(method, path, body);
+    } catch (err) {
+      // TikTok access tokens live ~24h. On an expired/invalid token, refresh once and retry.
+      if (isTikTokTokenError(err) && this.cfg.tiktokRefreshToken && !this.refreshedOnce) {
+        await this.refreshAccessToken();
+        return this.send<T>(method, path, body);
+      }
+      throw err;
+    }
+  }
+
+  private async send<T>(method: "GET" | "POST", path: string, body?: Record<string, unknown>): Promise<T> {
     const url = path.startsWith("http") ? path : `${TIKTOK_API_BASE}${path}`;
     let res: Response;
     try {
@@ -218,7 +273,27 @@ export function pickPrivacy(requested: string | undefined, options: string[]): s
   return options[0] ?? "SELF_ONLY";
 }
 
-export async function refreshTikTokToken(refreshToken: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+export function isTikTokTokenError(err: unknown): boolean {
+  if (!(err instanceof TikTokApiError)) return false;
+  const code = (err.body as { error?: { code?: string } } | null)?.error?.code;
+  if (code === "access_token_invalid" || code === "access_token_expired") return true;
+  return err.status === 401;
+}
+
+export type TikTokRefreshResult = {
+  accessToken: string;
+  /** TikTok may rotate the refresh token; callers must persist it when it changes. */
+  refreshToken?: string;
+  expiresIn?: number;
+  refreshExpiresIn?: number;
+  openId?: string;
+  scope?: string;
+};
+
+export async function refreshTikTokTokenFull(
+  refreshToken: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TikTokRefreshResult> {
   const clientKey = process.env.TIKTOK_CLIENT_KEY?.trim();
   const clientSecret = process.env.TIKTOK_CLIENT_SECRET?.trim();
   if (!clientKey || !clientSecret) {
@@ -230,16 +305,47 @@ export async function refreshTikTokToken(refreshToken: string, fetchImpl: typeof
     grant_type: "refresh_token",
     refresh_token: refreshToken,
   });
-  const res = await fetchImpl(`${TIKTOK_API_BASE}/v2/oauth/token/`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  const json = (await res.json()) as { access_token?: string; error?: string; error_description?: string };
+  let res: Response;
+  try {
+    res = await fetchImpl(`${TIKTOK_API_BASE}/v2/oauth/token/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+  } catch (err) {
+    throw new TikTokApiError(`TikTok token refresh request failed: ${safeErrorMessage(err)}`, 0, null);
+  }
+  let json: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    refresh_expires_in?: number;
+    open_id?: string;
+    scope?: string;
+    error?: string;
+    error_description?: string;
+  } = {};
+  try {
+    json = (await res.json()) as typeof json;
+  } catch {
+    /* non-JSON */
+  }
   if (!res.ok || !json.access_token) {
     throw new TikTokApiError(json.error_description || json.error || "TikTok token refresh failed", res.status, {
       error: json.error,
     });
   }
-  return json.access_token;
+  return {
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token || undefined,
+    expiresIn: json.expires_in,
+    refreshExpiresIn: json.refresh_expires_in,
+    openId: json.open_id,
+    scope: json.scope,
+  };
+}
+
+/** Back-compat: returns only the access token. Prefer refreshTikTokTokenFull() so rotation is not lost. */
+export async function refreshTikTokToken(refreshToken: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+  return (await refreshTikTokTokenFull(refreshToken, fetchImpl)).accessToken;
 }

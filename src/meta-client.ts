@@ -85,6 +85,12 @@ export class MetaClient {
       body?: Record<string, unknown>;
       dryRun?: boolean;
       encoding?: "json" | "form";
+      /**
+       * Return a SUCCESSFUL response body un-redacted. Only for internal callers that need a
+       * secret field (e.g. Page access_token) and never hand the raw body to tool output.
+       * Error bodies are always redacted.
+       */
+      raw?: boolean;
     } = {},
   ): Promise<
     | T
@@ -135,7 +141,9 @@ export class MetaClient {
     } catch {
       parsed = { raw: redactString(text) };
     }
-    parsed = redactDeep(parsed);
+    // Hotfix 2026-10-06: redacting every response turned Page access_token into "[REDACTED]".
+    // Keep redaction for errors and normal calls; skip it only for ok responses with raw:true.
+    if (!res.ok || !options.raw) parsed = redactDeep(parsed);
 
     if (!res.ok) {
       const errMsg =
@@ -151,8 +159,8 @@ export class MetaClient {
     return parsed as T;
   }
 
-  get<T = unknown>(path: string, query?: GraphParams) {
-    return this.request<T>("GET", path, { query });
+  get<T = unknown>(path: string, query?: GraphParams, opts?: { raw?: boolean }) {
+    return this.request<T>("GET", path, { query, raw: opts?.raw });
   }
 
   post<T = unknown>(

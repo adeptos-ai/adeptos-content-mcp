@@ -108,7 +108,7 @@ export function registerContentTools(server: McpServer): void {
 
   server.tool(
     "content_schedule_post",
-    "Publish now or schedule a Canva post. platforms[] = Opus Clip destination set. confirm:true required to mutate.",
+    "Publish now or schedule a Canva post. platforms[] = Opus Clip destination set. confirm:true required to mutate. Scheduled Instagram posts store media URLs and create Graph containers at publish time (containers expire after ~24h).",
     {
       brand: brandField,
       platforms: platformsField,

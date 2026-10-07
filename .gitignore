@@ -5,6 +5,8 @@ dist/
 .DS_Store
 coverage/
 data/*.json
+data/*.lock
+data/*.bak-*
 data/schedules.json
 data/media.json
 uploads/

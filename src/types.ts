@@ -41,9 +41,24 @@ export type MediaRecord = {
   child_urls?: string[];
   child_ids?: string[];
   collaborators?: string[];
+  cover_url?: string;
 };
 
-export type ScheduleStatus = "scheduled" | "publishing" | "published" | "cancelled" | "failed";
+/** What a scheduled job needs in order to build the post later. Not a Graph container id. */
+export type JobMedia = {
+  media_type: MediaType;
+  url: string;
+  media_id?: string;
+  cover_url?: string;
+};
+
+export type ScheduleStatus =
+  | "scheduled"
+  | "publishing"
+  | "published"
+  | "cancelled"
+  | "failed"
+  | "needs_review";
 
 export type SchedulePath = "mcp_cron" | "graph_native" | "youtube_native";
 
@@ -57,9 +72,13 @@ export type ScheduleJob = {
   publish_at_bogota: string;
   caption?: string;
   title?: string;
+  /**
+   * Legacy. IG containers expire after ~24h, so publish rebuilds from `media` and ignores this.
+   * New mcp_cron jobs leave it unset.
+   */
   container_id?: string;
   media_ids?: string[];
-  media?: Array<{ media_type: MediaType; url: string; media_id?: string }>;
+  media?: JobMedia[];
   also_post_fb: boolean;
   collaborators?: string[];
   created_at: string;
@@ -68,6 +87,12 @@ export type ScheduleJob = {
   fb_post_id?: string;
   published_at?: string;
   error?: string;
+  /** Publish attempts for this job (including the last failure). */
+  attempts?: number;
+  /** Process that moved the job to publishing. */
+  owner?: string;
+  /** ISO time. After this, a still-publishing job becomes needs_review and is not retried. */
+  lease_until?: string;
   confirm: true;
 };
 
