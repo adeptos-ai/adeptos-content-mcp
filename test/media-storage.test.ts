@@ -40,7 +40,7 @@ describe("durable media adapter", () => {
     );
   });
 
-  it("commits JPEG bytes and waits for a 200 HEAD on adeptos.ai", async () => {
+  it("commits JPEG bytes and waits for a 200 image HEAD (not the HTML fallback) on adeptos.ai", async () => {
     const calls: Array<{ url: string; method: string; auth: string | null; body?: string }> = [];
     let heads = 0;
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -52,7 +52,10 @@ describe("durable media adapter", () => {
       if (method === "PUT") return new Response(JSON.stringify({ content: { path: "ok" } }), { status: 201 });
       if (method === "HEAD") {
         heads += 1;
-        return new Response(null, { status: heads === 1 ? 404 : 200 });
+        // adeptos.ai answers 200 text/html (SPA fallback) until the deploy lands.
+        return heads === 1
+          ? new Response(null, { status: 200, headers: { "content-type": "text/html" } })
+          : new Response(null, { status: 200, headers: { "content-type": "image/jpeg" } });
       }
       return new Response("no", { status: 500 });
     };
@@ -89,7 +92,7 @@ describe("durable media adapter", () => {
     assert.equal(heads, 2);
     const head = calls.find((c) => c.method === "HEAD");
     assert.equal(head?.auth, null);
-    assert.equal(head?.url, saved.url);
+    assert.ok(head?.url.startsWith(`${saved.url}?cmcp_probe=`), "probe must not hit the clean (cacheable) URL");
   });
 
   it("does not echo the GitHub token when the contents API fails", async () => {

@@ -106,7 +106,7 @@ export class GitHubStaticStorage implements MediaStorage {
     const repoPath = `${this.opts.pathPrefix}/${name}`.replace(/\/{2,}/g, "/");
     await this.commit(repoPath, prepared.bytes);
     const url = publicUrlFor(this.opts.publicBase, repoPath);
-    await this.waitUntilLive(url);
+    await this.waitUntilLive(url, prepared.contentType);
     return { url, path: repoPath };
   }
 
@@ -144,21 +144,31 @@ export class GitHubStaticStorage implements MediaStorage {
     }
   }
 
-  private async waitUntilLive(url: string): Promise<void> {
+  /**
+   * adeptos.ai (nginx try_files -> /index.html) answers 200 text/html for ANY missing path, and
+   * Cloudflare caches that answer for .jpg/.mp4 paths (max-age=14400). So:
+   * - require the expected media content-type, not just 200;
+   * - probe with a unique query string so a pre-deploy HTML answer is never cached under the
+   *   clean URL that Meta/TikTok will fetch.
+   */
+  private async waitUntilLive(url: string, contentType: string): Promise<void> {
     const fetchImpl = this.opts.fetchImpl ?? fetch;
     const sleep = this.opts.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
     const deadline = Date.now() + this.opts.waitMs;
-    let last = 0;
+    const family = contentType.split("/")[0].toLowerCase();
+    let last = "none";
     for (;;) {
+      const probe = `${url}?cmcp_probe=${randomBytes(6).toString("hex")}`;
       try {
-        const res = await fetchImpl(url, { method: "HEAD" });
-        if (res.status === 200) return;
-        last = res.status;
+        const res = await fetchImpl(probe, { method: "HEAD", headers: { "Cache-Control": "no-cache" } });
+        const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+        if (res.status === 200 && ct.startsWith(`${family}/`)) return;
+        last = `${res.status} ${ct || "no-content-type"}`;
       } catch {
-        last = 0;
+        last = "network_error";
       }
       if (Date.now() >= deadline) {
-        throw new Error(`github_static_not_live: HEAD ${url} last_status=${last}. The landing deploy may still be running.`);
+        throw new Error(`github_static_not_live: HEAD ${url} last=${last}. The landing deploy may still be running.`);
       }
       if (this.opts.pollMs > 0) await sleep(this.opts.pollMs);
     }
