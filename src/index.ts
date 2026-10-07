@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
 import { startScheduleWorker } from "./worker.js";
+import { assertSingleStore } from "./store.js";
 
 function parseArgs(argv: string[]) {
   const http = argv.includes("--http") || process.env.MCP_TRANSPORT === "http";
@@ -88,6 +89,7 @@ async function startHttp(host: string, port: number) {
 }
 
 async function main() {
+  assertSingleStore();
   const { http, port, host } = parseArgs(process.argv.slice(2));
   if (http) await startHttp(host, port);
   else await startStdio();

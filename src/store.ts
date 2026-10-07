@@ -1,10 +1,46 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { withFileLockSync } from "./file-lock.js";
 import type { BrandKey, MediaRecord, ScheduleJob, ScheduleStatus } from "./types.js";
 
+/** Package root = parent of dist/ (or src/ under tsx). Never derived from process.cwd(). */
+export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * Single canonical store: CONTENT_DATA_DIR (resolved to an absolute path) or <package>/data.
+ * It used to fall back to <cwd>/data, so copies started from another directory wrote a second
+ * schedules.json and cancelled jobs came back.
+ */
 export function defaultDataDir(): string {
-  return process.env.CONTENT_DATA_DIR?.trim() || join(process.cwd(), "data");
+  const env = process.env.CONTENT_DATA_DIR?.trim();
+  return env ? resolve(env) : join(PACKAGE_ROOT, "data");
+}
+
+/**
+ * Startup guard: log the resolved store and refuse to start if a second, unmerged schedules.json
+ * exists in a place an older build could have used. A directory with a MIGRATED_TO marker is
+ * ignored. CONTENT_ALLOW_STRAY_STORE=1 downgrades the refusal to a warning.
+ */
+export function assertSingleStore(
+  opts: { log?: (m: string) => void; candidates?: string[] } = {},
+): string {
+  const log = opts.log ?? ((m: string) => console.error(m));
+  const dir = defaultDataDir();
+  log(`[store] data dir: ${dir}`);
+  const candidates = new Set(
+    (opts.candidates ?? [join(process.cwd(), "data"), join(PACKAGE_ROOT, "data"), "/workspace/data"]).map((d) => resolve(d)),
+  );
+  candidates.delete(resolve(dir));
+  for (const other of candidates) {
+    const f = join(other, "schedules.json");
+    if (existsSync(f) && !existsSync(join(other, "MIGRATED_TO"))) {
+      const msg = `[store] second schedule store found at ${f} (not migrated). Run scripts/merge-stores.mjs, or set CONTENT_ALLOW_STRAY_STORE=1.`;
+      if (process.env.CONTENT_ALLOW_STRAY_STORE === "1") log(`WARN ${msg}`);
+      else throw new Error(msg);
+    }
+  }
+  return dir;
 }
 
 export function storeLockPath(dataFile: string): string {
