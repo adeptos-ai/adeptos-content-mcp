@@ -27,6 +27,7 @@ import {
   publishFbVideo,
   publishIgContainer,
   publishIgFromSpec,
+  IgPublishUncertainError,
   waitForContainer,
 } from "./graph-content.js";
 import { fetchBytes, resolveSource } from "./http-media.js";
@@ -38,7 +39,7 @@ import { createMetaClientFromEnv, createMetaClientOptional, type MetaClient } fr
 import { missingMetaTokenError } from "./meta-tokens.js";
 import { normalizePlatforms, schedulePathFor } from "./platforms.js";
 import { withTransientRetries } from "./retry.js";
-import { requireConfirm, type WriteSafetyArgs } from "./safety.js";
+import { logInfo, requireConfirm, type WriteSafetyArgs } from "./safety.js";
 import { MediaRegistry, ScheduleStore, newScheduleId } from "./store.js";
 import { TikTokClient } from "./tiktok-client.js";
 import { formatBogota, formatUtc, parsePublishAt, toUnixSeconds } from "./timezone.js";
@@ -937,6 +938,25 @@ async function readCollaboratorInvites(
  * Transient Graph errors retry with backoff; attempts and the last error are written on the job.
  * The post id is saved as soon as media_publish succeeds.
  */
+class JobNeedsReviewError extends Error {
+  constructor(
+    readonly jobId: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "JobNeedsReviewError";
+  }
+}
+
+/** media_publish attempts per build (not-ready retries). Env CONTENT_IG_MEDIA_PUBLISH_ATTEMPTS, default 5. */
+function igMediaPublishMaxAttempts(): number {
+  return positiveInt(process.env.CONTENT_IG_MEDIA_PUBLISH_ATTEMPTS, 5, 1);
+}
+/** Backoff base before media_publish retry 2..N. Env CONTENT_IG_MEDIA_PUBLISH_RETRY_BASE_MS, default 5000. */
+function igMediaPublishRetryBaseMs(): number {
+  return positiveInt(process.env.CONTENT_IG_MEDIA_PUBLISH_RETRY_BASE_MS, 5000, 0);
+}
+
 function assertStillClaimed(store: ScheduleStore, jobId: string, owner: string): ScheduleJob {
   const fresh = store.get(jobId);
   if (!fresh || fresh.status === "cancelled") throw new JobCancelledError(jobId);
@@ -957,12 +977,14 @@ export async function publishScheduledInstagram(
   const store = scheduleStore(deps);
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
 
+  logInfo("publish", `${job.id} start`, { brand: job.brand, platform: job.platform, media: job.media?.length ?? 0 });
   const built = await withTransientRetries({
     maxAttempts: igPublishMaxAttempts(deps),
     baseDelayMs: igPublishRetryBaseMs(deps),
     sleep,
     onAttempt: (attempt, error) => {
       store.recordAttempt(job.id, owner, attempt, error);
+      logInfo("publish", `${job.id} build_attempt ${attempt}`, error ? { error } : { ok: true });
     },
     run: async () => {
       assertStillClaimed(store, job.id, owner);
@@ -973,9 +995,22 @@ export async function publishScheduledInstagram(
         waitForReady: deps.waitForReady !== false,
         timeoutMs: deps.igWaitTimeoutMs,
         intervalMs: deps.igWaitIntervalMs,
+        sleep,
+        publishMaxAttempts: igMediaPublishMaxAttempts(),
+        publishRetryBaseMs: deps.igRetryBaseMs ?? igMediaPublishRetryBaseMs(),
+        log: (event, extra) => logInfo("publish", `${job.id} ${event}`, extra),
       });
     },
+  }).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    logInfo("publish", `${job.id} failed`, { error: message, uncertain: err instanceof IgPublishUncertainError });
+    if (err instanceof IgPublishUncertainError) {
+      store.finishPublish(job.id, owner, { status: "needs_review", error: message });
+      throw new JobNeedsReviewError(job.id, message);
+    }
+    throw err;
   });
+  logInfo("publish", `${job.id} published`, { post_id: built.id, container_id: built.container_id });
 
   // Persist the post id before any follow-up Graph read (collaborator invites).
   store.finishPublish(job.id, owner, {
@@ -1039,6 +1074,10 @@ export async function processDueJobs(deps: ServiceDeps = {}, now = deps.now?.() 
       }
       results.push({ id: job.id, ...published });
     } catch (err) {
+      if (err instanceof JobNeedsReviewError) {
+        results.push({ id: job.id, status: "needs_review", error: err.message });
+        continue;
+      }
       if (err instanceof JobCancelledError || err instanceof ClaimLostError) {
         results.push({ id: job.id, status: err instanceof JobCancelledError ? "cancelled" : "skipped" });
         continue;
