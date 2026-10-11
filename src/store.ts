@@ -124,7 +124,7 @@ export class MediaRegistry {
 }
 
 export type FinishPublishPatch = {
-  status: "published" | "failed";
+  status: "published" | "failed" | "needs_review";
   post_id?: string;
   published_at?: string;
   error?: string;
