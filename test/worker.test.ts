@@ -41,3 +41,12 @@ describe("scheduler is off unless a process opts in", () => {
     assert.equal(workerEnabled(), false);
   });
 });
+
+import { lateTickGapMs } from "../src/worker.js";
+import { it as it2 } from "node:test";
+import assertLate from "node:assert/strict";
+it2("flags a poll gap longer than 3 intervals (paused process or suspended box)", () => {
+  assertLate.equal(lateTickGapMs(undefined, 1000, 30_000), undefined);
+  assertLate.equal(lateTickGapMs(0, 31_000, 30_000), undefined);
+  assertLate.equal(lateTickGapMs(0, 19 * 60_000, 30_000), 19 * 60_000);
+});
